@@ -1,0 +1,418 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib qw ( /usr/local/nagios/libexec /usr/lib/nagios/plugins /usr/lib64/nagios/plugins );
+use utils qw( %ERRORS $TIMEOUT &print_revision &support &usage );
+use Getopt::Long;
+use Net::Domain qw(hostname hostfqdn hostdomain domainname);
+
+# globals
+use vars qw(
+  $PROGNAME $VERSION $opt_version $opt_help $opt_host $opt_budest
+  $opt_suser $opt_spass $opt_domain $opt_euser $opt_epass $opt_erecip
+  $opt_mailserv $opt_mailport $opt_mailttype
+);
+my ($hostname,$dir,$timestamp,$newest_config,@sorted_files,$config_date_change,$cdifferences,
+    $cadditions,$cchanges,$cdeletions,$os);
+my $EXITSTRING = "";
+my $state = "";
+
+my %STATUS_CODE =
+  ( 'UNKNOWN' => '3', 'OK' => '0', 'WARNING' => '1', 'CRITICAL' => '2' );
+
+# config
+$PROGNAME    = $0;
+$VERSION     = '1.0.0';
+
+# init options
+$opt_version     = undef;
+$opt_help        = undef;
+$opt_host        = undef;
+$opt_suser       = undef;
+$opt_spass       = undef;
+$opt_euser       = undef;
+$opt_epass       = undef;
+$opt_erecip      = undef;
+$opt_mailserv    = undef;
+$opt_mailport    = undef;
+$opt_mailttype   = 'starttls';
+$opt_budest      = undef;
+$opt_domain      = hostdomain();
+
+# get options
+Getopt::Long::Configure('bundling');
+GetOptions(
+  'V|version'           => \$opt_version,
+  'h|help'              => \$opt_help,
+  'H|host=s'            => \$opt_host,
+  's|suser=s'           => \$opt_suser,
+  'S|spass=s'           => \$opt_spass,
+  'e|euser=s'           => \$opt_euser,
+  'E|epass=s'           => \$opt_epass,
+  'r|erecip=s'          => \$opt_erecip,
+  'm|mailserv=s'        => \$opt_mailserv,
+  'p|mailport=s'        => \$opt_mailport,
+  't|mailttype=s'       => \$opt_mailttype,
+  'b|budest=s'          => \$opt_budest,
+  'd|domain=s'          => \$opt_domain
+) or do {
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+};
+
+if ($opt_version) {
+  print_version();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if ($opt_help) {
+  print_help();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if (!$opt_host) {
+  print "Host option not given\n";
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if (!$opt_suser) {
+  print "SFTP/SSH user not given\n";
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if (!$opt_erecip) {
+  print "Eamil recipient address not given\n";
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if (!$opt_host) {
+  print "SFTP/SSH pass not given\n";
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+sub print_usage {
+  my $tab = ' ' x length($PROGNAME);
+  print <<EOB
+Usage:
+ check_switch_config -H host -d backupdest -s 'SFTP User' -S 'SFTP Pass' [-e 'SMTP User' -E 'SMTP Pass'] -r 'Email Recipient'
+ check_switch_config --version
+ check_switch_config --help
+EOB
+}
+
+sub print_version {
+  print_revision($PROGNAME, $VERSION);
+}
+
+sub print_help {
+  print_version();
+  print <<EOB;
+Backup switch configuration.
+EOB
+
+  print_usage();
+  print <<EOB;
+Required Arguments:
+ -H, --host=HOST
+    The name or address of the host to backup config from.
+ -b, --budest=BUDEST
+    Backup destination for config files.
+ -d, --domain=DOMAIN
+    Fully Qualified Domain of enviroment.  Will grab from host if not specified.  (eg. example.com)
+EOB
+}
+
+sub stop {
+    my $result = shift;
+    my $exit_code = shift;
+    print $result . "\n";
+    exit ( $STATUS_CODE{$exit_code} );
+}
+
+sub get_timestamp {
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)=localtime(time);
+    $timestamp = sprintf ( "%04d%02d%02d%02d%02d%02d",
+                           $year+1900,$mon+1,$mday,$hour,$min,$sec);
+}
+
+sub scan_completed {
+    my $self     = shift;
+    my $host     = shift;
+
+    my $hostname = $host->hostname();
+    my $addresses = join(',', map {$_->addr()} $host->addresses());
+    my $status = $host->status();
+ 
+    my $os_name = 'unknown OS';
+    if ( $status eq 'up' ) {
+        if ( $host->os() && $host->os()->osmatches() ) {
+            my ($os_type) = $host->os()->osmatches();
+            $os_name = $os_type->name();
+        }
+        $os = $os_name;
+    }
+
+}
+
+sub get_ostype {
+    use Nmap::Scanner;
+
+    my $scanner = new Nmap::Scanner;
+
+    $scanner->register_scan_complete_event(\&scan_completed);
+    $scanner->scan("-sT -p 22 --privileged -O --max_rtt_timeout 200ms --osscan-guess $opt_host");
+}
+ 
+sub get_hostname {
+    my $line;
+
+    if ($os =~ m/IOS|NX-OS/) {
+        open (FILE, "<", "/tmp/$opt_host.cfg") or die("Could not open file.");
+
+        while ($line = <FILE>) {
+            if ($line =~ m/hostname/) {
+                $line =~ /hostname\s*?(\S+)/;
+                $hostname = $1;
+                last;
+            }
+        }
+    } elsif ($os =~ m/HP/) {
+        while ($line = <@_>) {
+            if ($line =~ m/hostname/) {
+                $hostname = "next";
+                next;
+            }
+            if ($hostname) {
+                $hostname = $line;
+                last;
+            }
+        }
+    }
+}
+
+sub get_config {
+    use Net::SFTP;
+    use Net::Telnet;
+    use Net::OpenSSH;
+    use Net::SCP::Expect;
+
+    my %args = (
+        timeout     => 30,
+        user        => $opt_suser,
+        password    => $opt_spass
+    );
+
+    if ($os =~ m/IOS/) {
+        my $scpe = Net::SCP::Expect->new(%args);
+        $scpe->scp("$opt_host:running-config", "/tmp/$opt_host.cfg");
+        get_hostname();
+    } elsif ($os =~ m/NX-OS/) {
+        my $promptEnd = '/\w+[\$\%\#\>]\s{0,1}$/o';
+        my $timeout  = 60;
+        my $cmd = 'show run | no-more';
+        my $ssh = Net::OpenSSH->new($opt_host, %args);
+        $ssh->error and die "Unable to connect to remote host: " . $ssh->error;
+
+        my ( $fh, $pid ) = $ssh->open2pty( { stderr_to_stdout => 1 } );
+
+        my %params = (
+            fhopen    => $fh,
+            timeout   => $timeout,
+            telnetmode => 0,
+            output_record_separator => "\r",
+            cmd_remove_mode => 1,
+            errmode   => 'return',
+        );
+
+        my $conn = Net::Telnet->new(%params);
+        $conn->waitfor($promptEnd);
+
+        $conn->cmd($cmd);
+
+        open (FILE, ">", "/tmp/$opt_host.cfg") or die("Could not open file.");
+
+        my @lines = $conn->cmd($cmd);
+        @lines = @lines[ 5 .. $#lines-3 ];
+        foreach (@lines) {
+            print FILE $_;
+        }
+        close(FILE);
+
+        $conn->cmd("exit");
+
+        get_hostname();
+    } elsif ($os =~ m/HP/) {
+        my $sftp = Net::SFTP->new($opt_host, %args);
+        $sftp->get('cfg/running-config', "/tmp/$opt_host.cfg", \&get_hostname);
+    }
+}
+
+sub check_dir {
+    if (substr($opt_budest, -1) eq '/') {
+        $dir = "$opt_budest$hostname";
+    } else {
+        $dir = "$opt_budest/$hostname";
+    }
+    if (!-d $dir) {
+        if (!mkdir ($dir, 0755)) {
+            $state = "CRITICAL";
+            $EXITSTRING="$state - Could not create $dir.";
+            stop($EXITSTRING, $state);
+        }
+    } 
+}
+
+sub move_config {
+    use File::Copy;
+
+    if ($newest_config) {
+        $config_date_change = scalar localtime ((stat("$dir/$newest_config"))[9]);
+        my $files = scalar(@sorted_files);
+        if ($files > 4) {
+            my @oldest = @{$sorted_files[$files-1]};
+            my $oldest_config = pop(@oldest);
+            unlink "$dir/$oldest_config";
+        }        
+    }
+    move("/tmp/$opt_host.cfg", "$dir/$timestamp.cfg") or do {
+        $state="CRITICAL";
+        $EXITSTRING="$state - Cannot move config from /tmp to $dir.";
+        stop($EXITSTRING, $state);
+    };
+    $state="OK";
+    $EXITSTRING="$state - Config backup successful.";
+    if ($newest_config) {
+        alert_mail();
+    }
+}
+
+sub get_dir {
+    opendir(my $dh, $dir) or die "Error opening $dir: $!";
+    my @files = map { [ stat "$dir/$_", $_ ] } grep(! /^\.\.?$/, readdir($dh));
+    closedir($dh);
+
+    @sorted_files = sort rev_by_date @files;
+}
+
+sub compare_config {
+    use File::Compare;
+
+    if (scalar(@sorted_files) > 0) {
+        my @newest = @{$sorted_files[0]};
+        $newest_config = pop(@newest);
+
+        if (compare("$dir/$newest_config", "/tmp/$opt_host.cfg") == 0) {
+            $state = "OK";
+            $EXITSTRING="$state - No config changes needed to backup.";
+        } else {
+            get_diff();
+            move_config();
+        }
+    } else {
+        move_config();
+    }
+
+}
+
+sub rev_by_date { $b->[9] <=> $a->[9] }
+
+sub get_diff {
+    use File::Slurp qw (read_file);
+    use String::Similarity;
+    use List::Compare;
+
+    my $similarity;
+    my ($ischanged,$isdeleted,$isadded);
+    my (@cadditions,@cdeletions,@cchanges);
+
+    chomp (my @file1 = read_file "$dir/$newest_config");
+    chomp (my @file2 = read_file "/tmp/$opt_host.cfg");
+
+    my @oconfig = List::Compare->new( \@file1, \@file2)->get_Lonly;
+    my @nconfig = List::Compare->new( \@file1, \@file2)->get_Ronly;
+
+    for my $oline1 (@oconfig) {
+        for my $nline1 (@nconfig) {
+            $similarity = similarity $oline1, $nline1;
+            if ($similarity < .06) {
+                push (@cadditions, $oline1);
+                next;
+            }
+            elsif (($similarity > .06) and ($similarity < .50)) {
+                push (@cdeletions, $nline1);
+                next;
+            }
+            elsif (($similarity > .50) and ($similarity < 1)) {
+                push (@cchanges, $oline1);
+                next;
+            }
+        }
+    }
+
+    my @cadds = uniq(@cadditions);
+    my @cdels = uniq(@cdeletions);
+    my @cchgs = uniq(@cchanges);
+
+    $cdifferences = "<b>Additions</b><br>@cadds<br><br><b>Changes</b><br>@cchgs<br><br><b>Deletions</b><br>@cdels<br><br>";
+
+}
+
+sub uniq {
+    my %seen;
+    grep !$seen{$_}++, @_;
+}
+
+sub alert_mail {
+    use Net::SMTP;
+    use Email::Sender::Simple qw(sendmail);
+    use Email::Sender::Transport::SMTP qw();
+    use Try::Tiny;
+
+    my %transport = (
+        host => $opt_mailserv,
+        port => $opt_mailport,
+        ssl  => $opt_mailttype,
+        helo => $opt_domain,
+    );
+
+    if (($opt_euser) or ($opt_epass)) {
+        %transport = (%transport,
+            sasl_username => $opt_euser,
+            sasl_password => $opt_epass,
+        );
+    }
+    my $transport = Email::Sender::Transport::SMTP->new(%transport);#{
+
+    my $message = Email::Simple->create(
+        header => [
+            'From'          => "Nagios XI <no-reply@" . $opt_domain . ">",
+            'To'            => $opt_erecip,
+            'Subject'       => "ALERT: $hostname configuration changed",
+            'Content-Type'  => 'text/html; charset=UTF-8',
+        ],
+        body => "Before today, the last time the configuration was changed was on: <b>$config_date_change</b><br><br>$cdifferences",
+    );
+
+    try {
+        sendmail($message, {transport => $transport});
+    } catch {
+        die "Error sending email: $_";
+    };
+}
+
+sub cleanup {
+    unlink("/tmp/$opt_host.cfg");
+}
+
+get_timestamp();
+get_ostype();
+get_config();
+check_dir();
+get_dir();
+compare_config();
+cleanup();
+stop($EXITSTRING, $state);
