@@ -4,6 +4,7 @@ use strict;
 use lib qw ( /usr/local/nagios/libexec /usr/lib/nagios/plugins /usr/lib64/nagios/plugins );
 use utils qw( %ERRORS $TIMEOUT &print_revision &support &usage );
 use Getopt::Long;
+use Try::Catch;
 use Net::Domain qw(hostname hostfqdn hostdomain domainname);
 
 # globals
@@ -171,8 +172,13 @@ sub get_hostname {
     my $line;
 
     if ($os =~ m/IOS|NX-OS/) {
-        open (FILE, "<", "/tmp/$opt_host.cfg") or die("Could not open file.");
-
+        try {
+            open (FILE, "<", "/tmp/$opt_host.cfg");
+        } catch {
+            $state = "CRITICAL";
+            $EXITSTRING = "$state - Could not open file /tmp/$opt_host.cfg";
+            stop($EXITSTRING, $state);
+        };
         while ($line = <FILE>) {
             if ($line =~ m/hostname/) {
                 $line =~ /hostname\s*?(\S+)/;
@@ -215,7 +221,11 @@ sub get_config {
         my $timeout  = 60;
         my $cmd = 'show run | no-more';
         my $ssh = Net::OpenSSH->new($opt_host, %args);
-        $ssh->error and die "Unable to connect to remote host: " . $ssh->error;
+        $ssh->error and do {
+            $state = "CRITICAL";
+            $EXITSTRING = "$state - Unable to connect to remote host: " . $ssh->error;
+            stop($EXITSTRING, $state);
+        };
 
         my ( $fh, $pid ) = $ssh->open2pty( { stderr_to_stdout => 1 } );
 
@@ -233,7 +243,13 @@ sub get_config {
 
         $conn->cmd($cmd);
 
-        open (FILE, ">", "/tmp/$opt_host.cfg") or die("Could not open file.");
+        try {
+            open (FILE, ">", "/tmp/$opt_host.cfg");
+        } catch {
+            $state = "CRITICAL";
+            $EXITSTRING = "$state - Could not open file /tmp/$opt_host.cfg";
+            stop($EXITSTRING, $state);
+        };
 
         my @lines = $conn->cmd($cmd);
         @lines = @lines[ 5 .. $#lines-3 ];
@@ -246,8 +262,18 @@ sub get_config {
 
         get_hostname();
     } elsif ($os =~ m/HP/) {
-        my $sftp = Net::SFTP->new($opt_host, %args);
-        $sftp->get('cfg/running-config', "/tmp/$opt_host.cfg", \&get_hostname);
+        try {
+            my $sftp = Net::SFTP->new($opt_host, %args);
+            $sftp->get('cfg/running-config', "/tmp/$opt_host.cfg", \&get_hostname);
+        } catch {
+            $state = "CRITICAL";
+            my @error = grep /\S/, split /\n/, $_;
+            pop @error;
+            my $emsg = "$state - ";
+            $emsg .= join '', map "$_", @error;
+            $EXITSTRING = $emsg;
+            stop($EXITSTRING, $state);
+        }
     }
 }
 
@@ -291,7 +317,16 @@ sub move_config {
 }
 
 sub get_dir {
-    opendir(my $dh, $dir) or die "Error opening $dir: $!";
+    my $dh;
+
+    try {
+        opendir($dh, $dir);
+    } catch {
+        $state = "CRITICAL";
+        $EXITSTRING = "$state - Error opening $dir: $!";
+        stop($EXITSTRING, $state);
+    };
+
     my @files = map { [ stat "$dir/$_", $_ ] } grep(! /^\.\.?$/, readdir($dh));
     closedir($dh);
 
@@ -335,20 +370,26 @@ sub get_diff {
     my @oconfig = List::Compare->new( \@file1, \@file2)->get_Lonly;
     my @nconfig = List::Compare->new( \@file1, \@file2)->get_Ronly;
 
-    for my $oline1 (@oconfig) {
-        for my $nline1 (@nconfig) {
-            $similarity = similarity $oline1, $nline1;
-            if ($similarity < .06) {
-                push (@cadditions, $oline1);
-                next;
-            }
-            elsif (($similarity > .06) and ($similarity < .50)) {
-                push (@cdeletions, $nline1);
-                next;
-            }
-            elsif (($similarity > .50) and ($similarity < 1)) {
-                push (@cchanges, $oline1);
-                next;
+    if ((@oconfig) and !(@nconfig)) {
+        @cdeletions = @oconfig;
+    } elsif ((@nconfig) and !(@oconfig)) {
+        @cadditions = @nconfig;
+    } else {
+        for my $oline1 (@oconfig) {
+            for my $nline1 (@nconfig) {
+                $similarity = similarity $oline1, $nline1;
+                if ($similarity < .06) {
+                    push (@cadditions, $oline1);
+                    next;
+                }
+                elsif (($similarity > .06) and ($similarity < .50)) {
+                    push (@cdeletions, $nline1);
+                    next;
+                }
+                elsif (($similarity > .50) and ($similarity < 1)) {
+                    push (@cchanges, $oline1);
+                    next;
+                }
             }
         }
     }
@@ -370,7 +411,6 @@ sub alert_mail {
     use Net::SMTP;
     use Email::Sender::Simple qw(sendmail);
     use Email::Sender::Transport::SMTP qw();
-    use Try::Tiny;
 
     my %transport = (
         host => $opt_mailserv,
@@ -400,7 +440,9 @@ sub alert_mail {
     try {
         sendmail($message, {transport => $transport});
     } catch {
-        die "Error sending email: $_";
+        $state = "CRITICAL";
+        $EXITSTRING = "$state - Error sending email: $_";
+        stop($EXITSTRING, $state);
     };
 }
 
