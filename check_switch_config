@@ -267,11 +267,9 @@ sub get_config {
             $sftp->get('cfg/running-config', "/tmp/$opt_host.cfg", \&get_hostname);
         } catch {
             $state = "CRITICAL";
-            my @error = grep /\S/, split /\n/, $_;
-            pop @error;
-            my $emsg = "$state - ";
-            $emsg .= join '', map "$_", @error;
-            $EXITSTRING = $emsg;
+            (my $emsg = $_) =~ s/ at.*\n//;
+            chomp($emsg);
+            $EXITSTRING = "$state - $emsg";
             stop($EXITSTRING, $state);
         }
     }
